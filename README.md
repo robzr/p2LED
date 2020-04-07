@@ -1,23 +1,30 @@
 # p2LED
-ATtiny85 APA102C controller with rotary incremental encoder UI
+Digispark / ATtiny85 multi-mode LED strip controller with rotary encoder switch control
 
 ## Features
 - APA102C control via SPI bus
-- Interrupt driven queued rotary incremental encoder w/ switch controls
-- (TODO) Sleep mode
+- Interrupt driven queued rotary incremental encoder + switch control
+- Supports at least 144 LED (high density 1m) strips in all modes
+- Multi-mode - adjustable solid, as well as effects
 - (TODO) Setup via UI with values saved to EEPROM
+- (TODO) Optional external switch mode to use with cabinet switch input
 - (TODO) HSV solid mode
 
 ## Pinout
-- PB0 -> LED clock 
-- PB1 -> LED data
-- PB2 -> Encoder0
-- PB3 -> Encoder1
-- PB4 -> Switch
-- PB5 -> Tiny Serial out (debug); else EXT pin out to control external regulator
+- PB0 -> APA102 clock 
+- PB1 -> APA102 data
+- PB2 -> Encoder CLK (to ground)
+- PB3 -> Encoder DT (follows CLK by 90 degrees) (to ground)
+- PB4 -> Encoder Switch (to ground)
+- PB5 -> (Optional, to ground) external switch for instant wake/sleep
 
 ## UI
 Description of UI modes & controls
+
+### Button Timing
+0ms - 750ms    -> Short Press
+750ms - 1500ms -> Long Press
+1500ms+        -> Super Long Press
 
 ### Modes
 | Mode        | Control     | Action |

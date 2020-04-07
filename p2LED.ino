@@ -1,44 +1,19 @@
-/* 
- * ATtiny85 on macOS  -> https://gist.github.com/gurre/20441945fdcbb0c2f2c346d9f894a361
- * Digispark Basics   -> http://digistump.com/wiki/digispark/tutorials/basics
- * Digispark Tutorial -> http://digistump.com/wiki/digispark/tutorials/connecting
- * ATtiny85           -> https://ww1.microchip.com/downloads/en/DeviceDoc/Atmel-2586-AVR-8-bit-Microcontroller-ATtiny25-ATtiny45-ATtiny85_Datasheet.pdf
- * 
- * 0 -> PB0 MOSI/DI/SDA/AIN0/OC0A/OC1A/AREF/PCINT0 
- * 1 -> PB1 MISO/DO/AIN1/OC0B/OC1A/PCINT1            <- onboard LED
- * 2 -> PB2 SCK/USCK/SCL/ADC1/T0/INT0/PCINT2         <- default serial for ATtinySerialOut
- * 3 -> PB3 PCINT3/XTAL1/CLKI/OC1B/ADC3              <- USB comm at boot
- * 4 -> PB4 PCINT4/XTAL2/CLKO/OC1B/ADC2              <- USB comm at boot
- * 5 -> PB5 PCINT5/RESET/ADC0/dW
- * 
- * APA102 - uses 2-wire SPI      -> https://cpldcpu.wordpress.com/2014/08/27/apa102/  
- * Pololu APA102 lib w/ ATTiny85 https://gist.github.com/beriberikix/db669e29c92935c71a9a
- * WS2812 -> uses 800 khz signal
- * I2C -> https://www.instructables.com/id/Using-an-I2C-LCD-on-Attiny85/
- * EEPROM -> https://www.avrfreaks.net/forum/solved-attiny85-eeprom
- *   // should do 100k write cycles (conservatively) ; save settings after inactivity timer.
- * SLEEP -> https://arduino.stackexchange.com/questions/61721/attiny85-reset-itself-instead-of-wakeup-procedure
- *       -> https://gist.github.com/JChristensen/5616922
- *       -> http://www.technoblogy.com/show?KX0
- * Attiny85 takes ~.5uA in power-down mode :)
- * Interrupts -> https://www.avrfreaks.net/forum/triggering-isrpcint0vect-interrupts
- * Globals may be the fastest due to absolute pointers rather than relative to stack https://forum.arduino.cc/index.php?topic=473309.0
+/* free_memory() => 459 
+ * need 432 bytes for 144[3] HSV buffer
  */
 #include <Arduino.h>
 #include <avr/io.h>
 #include <avr/interrupt.h>
 #include <avr/sleep.h>
-#include <stdint.h>          // for uint*_t
-
-#include "encoder_event.h"
-
+#include <stdint.h>
 
 #define DEBUG
-
 // used with DEBUG
 #include "ATtinySerialOut.h"  // https://github.com/ArminJo/ATtinySerialOut (defaults to PB2)
 #include "memoryFree.h"       // for memoryFree();
 
+#define adc_disable() (ADCSRA &= ~(1<<ADEN))  // disable ADC (before power-off) as it uses ~320uA
+#define acomp_disable() (ACSR |= _BV(ACD))    // disable analog comparator
 
 // Pin assignments
 #define PIN_ENCODER0   PB0
@@ -47,49 +22,68 @@
 #define PIN_TINYSERIAL PB2
 #define PIN_SWITCH     PB4
 
-// Encoder & switch pinout masks
-#define MASK_ENCODER0 (1 << PIN_ENCODER0)
-#define MASK_ENCODER1 (1 << PIN_ENCODER1)
-#define MASK_ENCODER (MASK_ENCODER0 | MASK_ENCODER1)
-#define MASK_SWITCH (1 << PIN_SWITCH)
+// Encoder & switch bitmasks to apply to PINB register
+#define ENCODER_CLK (1 << PIN_ENCODER0)
+#define ENCODER_DT (1 << PIN_ENCODER1)
+#define ENCODER (ENCODER_CLK | ENCODER_DT)
+#define ENCODER_LEFT ENCODER_CLK
+#define ENCODER_LEFT_A ENCODER_DT
+#define ENCODER_LEFT_B ENCODER_CLK
+#define ENCODER_RIGHT ENCODER
+#define ENCODER_RIGHT_A (ENCODER_CLK & ENCODER_DT)
+#define ENCODER_RIGHT_B (ENCODER_CLK | ENCODER_DT)
+#define SWITCH (1 << PIN_SWITCH)
 
-// Encoder direction masks
-#define ENCODER_DIR0A MASK_ENCODER1
-#define ENCODER_DIR0B MASK_ENCODER0
-#define ENCODER_DIR1A (MASK_ENCODER0 & MASK_ENCODER1)
-#define ENCODER_DIR1B (MASK_ENCODER0 | MASK_ENCODER1)
+// For tuning linear encoder acceleration, TODO: consider exponential or logarithmic
+#define ENCODER_SCALE_WINDOW 100  // ms for accelleration window
+#define ENCODER_SCALE_FACTOR 10   // divisor that determines accelleration rate
 
-#define adc_disable() (ADCSRA &= ~(1<<ADEN))  // disable ADC (before power-off) as it uses ~320uA
-#define acomp_disable() (ACSR |= _BV(ACD))    // disable analog comparator
+// Interrupt event queue
+#define MAX_EVENT_COUNT 6  // how many events to queue, TODO: tune (reduce & backoff)
 
-struct encoder_event * volatile encoder_events;  // linked list for encoder FIFO
-volatile uint8_t pinb_history;                   // tracks history to compare last event
+enum Events {
+  Encoder_Left,
+  Encoder_Right,
+  Switch_Down,
+  Switch_Up
+};
+
+struct event {
+  uint16_t time;
+  uint8_t event;
+} volatile events[MAX_EVENT_COUNT];
+
+volatile uint8_t event_count = 0;
+volatile uint8_t pinb_history;     // to determine which pin change event caused an interrupt
+volatile uint8_t encoder_history;  // to store first phase of quadrature events
+
+// last_* use the lower 15 bits to track 32 seconds of time; the top bit to determine state
+#define LAST_ACTIVE (uint16_t) (1 << 15)
+uint16_t last_encoder_left = 0;
+uint16_t last_encoder_right = 0;
+uint16_t last_switch_down = 0;
+
+uint8_t brightness = 128;
+
+
+inline void process_event_queue() __attribute__((always_inline));
+inline void process_last_timeouts() __attribute__((always_inline));
 
 void setup() {
-#ifdef DEBUG
-  initTXPin();  // defaults to PB2; oddly, sets PB2 as input (?)
-  delay(20);  
-  Serial.println(F("\n\n\n\n\rsetup()\n\r-------"));
-  Serial.print(F("- free_memory:   ")); Serial.println(freeMemory());
-  Serial.print(F("- MASK_ENCODER0: ")); Serial.println(MASK_ENCODER0, BIN);
-  Serial.print(F("- MASK_ENCODER1: ")); Serial.println(MASK_ENCODER1, BIN);
-  Serial.print(F("- MASK_ENCODER:  ")); Serial.println(MASK_ENCODER, BIN);
-  Serial.print(F("- MASK_SWITCH:   ")); Serial.println(MASK_SWITCH, BIN);
-#endif
-
+  adc_disable();
+  acomp_disable();
 
   // Data Direction Register B - set as inputs ... aka _BV(PB3) aka = 0b00001000; to turn off, use &= ~(1 << PB3)
-  DDRB |= (1 << PB0);
-  DDRB |= (1 << PB1);
-  DDRB |= (1 << PB4);
+  DDRB |= (1 << PIN_ENCODER0);  // normally use PBx 
+  DDRB |= (1 << PIN_ENCODER1);
+  DDRB |= (1 << PIN_SWITCH);
 
   // Port B pullup register - reading this directly seems to cause a crash (?)
-  PORTB |= (1 << PB0);
-  PORTB |= (1 << PB1);
-  PORTB |= (1 << PB4);
-//   PORTB |= (1 << PB5);
+  PORTB |= (1 << PIN_ENCODER0);  // normally use PBx
+  PORTB |= (1 << PIN_ENCODER1);
+  PORTB |= (1 << PIN_SWITCH);
 
-  // PCMSK: Pin Change Mask register for interrupts ; PCINT*: Pin Change INTerrupt #
+  // PCMSK: Pin Change Mask register for interrupts ; PCINTx: Pin Change INTerrupt #
   PCMSK |= (1 << PCINT0);
   PCMSK |= (1 << PCINT4);
   
@@ -99,82 +93,103 @@ void setup() {
   sei();
   
   pinb_history = PINB;
+  last_switch_down &= PINB & SWITCH;
+  
+#ifdef DEBUG
+  initTXPin();  // defaults to PB2; oddly, sets PB2 as input (?)
+  delay(20);  
+  Serial.print(F("\n\n\n\n\rsetup(); free_memory() == "));
+  Serial.println(freeMemory());
+#endif
 }
+
 
 void loop() {
-  struct encoder_event *tmp_event;
-
-  if(encoder_events) {
-    cli();
+  if(event_count) {
+    process_event_queue();
 #ifdef DEBUG
-    uint8_t queue_length = 1;
-    tmp_event = encoder_events;
-    while(tmp_event->next) {
-      queue_length++;
-      tmp_event = tmp_event->next;
-    }
-#endif
+    for(uint8_t x = 0; x < brightness; x++) Serial.print(F("."));
+    Serial.println();
+#endif    
+  }
 
-    tmp_event = encoder_events;
-    encoder_events = encoder_events->next;
+  process_last_timeouts();
+}
+
+// process interrupt event queue
+inline void process_event_queue() {
+  while(event_count) {
+    uint8_t tmp_byte = 0;
+    uint8_t tmp_event; 
+    uint16_t tmp_time;
+
+    cli();  // disable interrupts while we pop an event off the event queue
+    tmp_time = events[0].time;
+    tmp_event = events[0].event;
+    do {
+      events[tmp_byte].time = events[tmp_byte + 1].time;
+      events[tmp_byte].event = events[tmp_byte + 1].event;
+    } while(++tmp_byte < event_count - 1);
+    event_count--;
     sei();
-
-    if((tmp_event->pinb ^ pinb_history) & MASK_SWITCH) {
-      if(tmp_event->pinb & MASK_SWITCH)
-        Serial.println("Switch release");
-      else
-        Serial.println("Switch press");
-    } else if((tmp_event->pinb ^ pinb_history) & MASK_ENCODER0) {
-      switch(tmp_event->pinb & MASK_ENCODER) {
-        case ENCODER_DIR0A:
-          Serial.println(F("Encoder left (rising)"));
-          break;
-        case ENCODER_DIR0B:
-          Serial.println(F("Encoder left (falling)"));
-          break;
-        case ENCODER_DIR1A:
-          Serial.println(F("Encoder right (rising)"));
-          break;
-        case ENCODER_DIR1B:
-          Serial.println(F("Encoder right (falling)"));
-          break;
+      
+    if(tmp_event == Encoder_Left) {
+      if(last_encoder_left & LAST_ACTIVE && (tmp_time - last_encoder_left & ~LAST_ACTIVE) < ENCODER_SCALE_WINDOW) {
+        tmp_byte = (ENCODER_SCALE_WINDOW - (tmp_time - last_encoder_left & ~LAST_ACTIVE)) / ENCODER_SCALE_FACTOR + 1;
+        brightness -= brightness > tmp_byte ? tmp_byte : brightness;
+      } else if(brightness > 0) {
+        brightness--;
       }
+      last_encoder_left = (uint16_t) (tmp_time | LAST_ACTIVE);
+      last_encoder_right &= ~LAST_ACTIVE;
+    } else if(tmp_event == Encoder_Right) {
+      if(last_encoder_right & LAST_ACTIVE && (tmp_time - last_encoder_right & ~LAST_ACTIVE) < ENCODER_SCALE_WINDOW) {
+        tmp_byte = (ENCODER_SCALE_WINDOW - (tmp_time - last_encoder_right & ~LAST_ACTIVE)) / ENCODER_SCALE_FACTOR + 1;     
+        brightness += tmp_byte < 255 - brightness ? tmp_byte : 255 - brightness;
+      } else if(brightness < 255)
+        brightness++;
+      last_encoder_right = (uint16_t) (tmp_time | LAST_ACTIVE);
+      last_encoder_left &= ~LAST_ACTIVE;
+    } else if(tmp_event == Switch_Down) {
+      last_switch_down = LAST_ACTIVE | tmp_time;
+      Serial.print(F("Switch Pressed - event time: ")); Serial.println(last_switch_down & ~LAST_ACTIVE);
+    } else if(tmp_event == Switch_Up) {
+      last_switch_down &= ~LAST_ACTIVE;
+      Serial.print(F("Switch Released - event time: ")); Serial.print((uint16_t) tmp_time & ~LAST_ACTIVE);
+      Serial.print(F(" down time: ")); Serial.println(tmp_time - last_switch_down & ~LAST_ACTIVE);
     }
-    
-//    uint8_t changed_bits = (tmp_event->pinb ^ pinb_history); //  & (MASK_SWITCH | MASK_ENCODER0);
-     
-#ifdef DEBUGx 
-    Serial.print(F("loop() time_now:")); Serial.print(millis());
-    Serial.print(F(" free_memory: "));   Serial.print(freeMemory()); 
-    Serial.print(F(" queue_length: "));  Serial.println(queue_length);   
-    encoder_event_print(tmp_event);
-//    Serial.print(F("- pinb_history: "));   Serial.println(pinb_history, BIN); 
-//    Serial.print(F("- changed_bits: "));   Serial.println(changed_bits, BIN); 
-#endif
-    pinb_history = tmp_event->pinb;
-    free(tmp_event);
   }
 }
 
+// expire 15-bit time counters before they rollover; this allows event tracking ~30 seconds
+inline void process_last_timeouts() {
+  if(last_encoder_left & LAST_ACTIVE && ((uint16_t) millis() - last_encoder_left) & ~LAST_ACTIVE > 31000)
+    last_encoder_left &= ~LAST_ACTIVE;
+  if(last_encoder_right & LAST_ACTIVE && ((uint16_t) millis() - last_encoder_right) & ~LAST_ACTIVE > 31000)
+    last_encoder_right &= ~LAST_ACTIVE;
+  if(last_switch_down & LAST_ACTIVE && ((uint16_t) millis() - last_switch_down) & ~LAST_ACTIVE > 31000)
+    last_switch_down &= ~LAST_ACTIVE;
+}
 
+// TODO: add pin ground event
 ISR(PCINT0_vect) {
-  // This logic is going to save on *all* interrupts; we should filter
-  struct encoder_event * event = encoder_events;
-  struct encoder_event * new_event = (struct encoder_event*)malloc(sizeof(struct encoder_event));
-  
-  if(new_event) {
-    new_event->time = (uint16_t) millis();
-    new_event->pinb = (uint8_t) PINB;
-    new_event->next = 0;
-    cli();
-    if(event) {
-      while(event->next) event = event->next;
-      event->next = new_event;
-    } else {
-      encoder_events = new_event;
+  if(event_count < MAX_EVENT_COUNT - 1) {
+    if((PINB ^ pinb_history) & SWITCH) {
+      events[event_count].time = (uint16_t) millis();    
+      if(PINB & SWITCH)
+        events[event_count++].event = Switch_Up;
+      else
+        events[event_count++].event = Switch_Down;
+    } else if((PINB ^ pinb_history) & ENCODER) {
+      events[event_count].time = (uint16_t) millis();      
+      if(PINB & ENCODER_LEFT == ENCODER_LEFT_B && encoder_history == ENCODER_LEFT_A)
+        events[event_count++].event = Encoder_Left;
+      else if(PINB & ENCODER_RIGHT == ENCODER_RIGHT_B && encoder_history == ENCODER_RIGHT_A)
+        events[event_count++].event = Encoder_Right;
+      encoder_history = PINB & ENCODER;
     }
-    sei();
   }
+  pinb_history = PINB;
 }
 
 
