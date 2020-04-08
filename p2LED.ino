@@ -140,9 +140,8 @@ inline void process_event_queue() {
       if(last_encoder_left & LAST_ACTIVE && (tmp_time - last_encoder_left & ~LAST_ACTIVE) < ENCODER_SCALE_WINDOW) {
         tmp_byte = (ENCODER_SCALE_WINDOW - (tmp_time - last_encoder_left & ~LAST_ACTIVE)) / ENCODER_SCALE_FACTOR + 1;
         brightness -= brightness > tmp_byte ? tmp_byte : brightness;
-      } else if(brightness > 0) {
+      } else if(brightness > 0)
         brightness--;
-      }
       last_encoder_left = (uint16_t) (tmp_time | LAST_ACTIVE);
       last_encoder_right &= ~LAST_ACTIVE;
     } else if(tmp_event == Encoder_Right) {
@@ -155,11 +154,14 @@ inline void process_event_queue() {
       last_encoder_left &= ~LAST_ACTIVE;
     } else if(tmp_event == Switch_Down) {
       last_switch_down = LAST_ACTIVE | tmp_time;
-      Serial.print(F("Switch Pressed - event time: ")); Serial.println(last_switch_down & ~LAST_ACTIVE);
+      Serial.print(F("Switch Pressed - event time: "));
+      Serial.println(last_switch_down & ~LAST_ACTIVE);
     } else if(tmp_event == Switch_Up) {
       last_switch_down &= ~LAST_ACTIVE;
-      Serial.print(F("Switch Released - event time: ")); Serial.print((uint16_t) tmp_time & ~LAST_ACTIVE);
-      Serial.print(F(" down time: ")); Serial.println(tmp_time - last_switch_down & ~LAST_ACTIVE);
+      Serial.print(F("Switch Released - event time: "));
+      Serial.print((uint16_t) tmp_time & ~LAST_ACTIVE);
+      Serial.print(F(" down time: "));
+      Serial.println(tmp_time - last_switch_down & ~LAST_ACTIVE);
     }
   }
 }
