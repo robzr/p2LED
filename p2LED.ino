@@ -71,7 +71,8 @@ inline void process_event_queue() __attribute__((always_inline));
 inline void process_last_timeouts() __attribute__((always_inline));
 
 
-void setup() {
+void setup()
+{
   adc_disable();
   acomp_disable();
 
@@ -106,7 +107,8 @@ void setup() {
 }
 
 
-void loop() {
+void loop()
+{
   if(event_count) {
     process_event_queue();
 #ifdef DEBUG
@@ -120,7 +122,8 @@ void loop() {
 }
 
 // process interrupt event queue
-inline void process_event_queue() {
+inline void process_event_queue()
+{
   while(event_count) {
     uint8_t tmp_byte = 0;
     uint8_t tmp_event; 
@@ -167,7 +170,8 @@ inline void process_event_queue() {
 }
 
 // expire 15-bit time counters before they rollover; this allows event tracking ~30 seconds
-inline void process_last_timeouts() {
+inline void process_last_timeouts()
+{
   if(last_encoder_left & LAST_ACTIVE && ((uint16_t) millis() - last_encoder_left) & ~LAST_ACTIVE > 31000)
     last_encoder_left &= ~LAST_ACTIVE;
   if(last_encoder_right & LAST_ACTIVE && ((uint16_t) millis() - last_encoder_right) & ~LAST_ACTIVE > 31000)
@@ -177,7 +181,8 @@ inline void process_last_timeouts() {
 }
 
 // TODO: add pin ground event
-ISR(PCINT0_vect) {
+ISR(PCINT0_vect)
+{
   if(event_count < MAX_EVENT_COUNT - 1) {
     if((PINB ^ pinb_history) & SWITCH) {
       events[event_count].time = (uint16_t) millis();    
