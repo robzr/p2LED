@@ -3,7 +3,7 @@ Digispark / ATtiny85 multi-mode LED strip controller with rotary encoder switch 
 
 ## Features
 - APA102C control via SPI bus
-- Interrupt driven queued rotary incremental encoder + switch control
+- Interrupt driven, queued event driven handling of rotary incremental encoder + switch control
 - Supports at least 144 LED (high density 1m) strips in all modes
 - Multi-mode - adjustable solid, as well as effects
 - (TODO) Setup via UI with values saved to EEPROM
@@ -22,9 +22,9 @@ Digispark / ATtiny85 multi-mode LED strip controller with rotary encoder switch 
 Description of UI modes & controls
 
 ### Button Timing
-0ms - 750ms    -> Short Press
-750ms - 1500ms -> Long Press
-1500ms+        -> Super Long Press
+- 0ms - 750ms    -> Short Press
+- 750ms - 1500ms -> Long Press
+- 1500ms+        -> Super Long Press
 
 ### Modes
 | Mode        | Control     | Action |

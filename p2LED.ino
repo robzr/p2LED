@@ -1,5 +1,5 @@
 /* free_memory() => 459 
- * need 432 bytes for 144[3] HSV buffer
+ * need 432 bytes for HSV[144] buffer to accomodate high density 1m strips
  */
 #include <Arduino.h>
 #include <avr/io.h>
@@ -8,6 +8,7 @@
 #include <stdint.h>
 
 #define DEBUG
+
 // used with DEBUG
 #include "ATtinySerialOut.h"  // https://github.com/ArminJo/ATtinySerialOut (defaults to PB2)
 #include "memoryFree.h"       // for memoryFree();
@@ -35,8 +36,8 @@
 #define SWITCH (1 << PIN_SWITCH)
 
 // For tuning linear encoder acceleration, TODO: consider exponential or logarithmic
-#define ENCODER_SCALE_WINDOW 100  // ms for accelleration window
-#define ENCODER_SCALE_FACTOR 10   // divisor that determines accelleration rate
+#define ENCODER_SCALE_WINDOW 100  // ms for acceleration window
+#define ENCODER_SCALE_FACTOR 10   // divisor that determines acceleration rate
 
 // Interrupt event queue
 #define MAX_EVENT_COUNT 6  // how many events to queue, TODO: tune (reduce & backoff)
@@ -68,6 +69,7 @@ uint8_t brightness = 128;
 
 inline void process_event_queue() __attribute__((always_inline));
 inline void process_last_timeouts() __attribute__((always_inline));
+
 
 void setup() {
   adc_disable();
@@ -108,7 +110,8 @@ void loop() {
   if(event_count) {
     process_event_queue();
 #ifdef DEBUG
-    for(uint8_t x = 0; x < brightness; x++) Serial.print(F("."));
+    for(uint8_t x = 0; x < brightness; x++)
+      Serial.print(F("."));
     Serial.println();
 #endif    
   }
@@ -191,13 +194,3 @@ ISR(PCINT0_vect) {
   }
   pinb_history = PINB;
 }
-
-
-/*
-  adc_disable();
-  acomp_disable();
-  set_sleep_mode(SLEEP_MODE_PWR_DOWN);
-
-  sleep_enable();
-  sleep_cpu();
-*/
