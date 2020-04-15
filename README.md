@@ -1,15 +1,21 @@
 # p2LED
 Digispark / ATtiny85 multi-mode LED strip controller with rotary encoder switch control
 
+## What is it?
+A high performance, efficient, menu driven, addressable LED controller that uses the dirt cheap Digispark board (available for $1.50 shipped on eBay). The menu system is based on input from a rotary encoder with a switch. One remaining pin can be used to wake/sleep the unit, which is useful for things like cabinet lighting. With low quiescent current requirements, this controller is usable in battery driven applications like Camper Vans.
+
 ## Features
-- APA102C control via SPI bus
+- APA102C/SK9822 LED strip control via SPI bus
+- HSV interface and effects via FastLED library
 - Interrupt driven, queued event driven handling of rotary incremental encoder + switch control
-- Mixed logarithmic/linear encoder acceleration
+- Logarithmic dampened linear encoder acceleration algorithm for smooth and quick rotary input
 - Supports at least 144 LED (high density 1m) strips in all modes
-- Multi-mode - adjustable solid, as well as effects
-- (TODO) Setup via UI with values saved to EEPROM
+- Multi-mode - switchable and tunable solid, rainbow, breathing effects
+- Holding the switch while running will save the current mode as startup mode, and the current mode settings to EEPROM
+- Holding the switch on boot enters setup mode, used to change the LED strip length
+- Holding the switch on boot for a real long time resets the EEPROM
 - (TODO) Optional external switch mode to use with cabinet switch input
-- (TODO) HSV solid mode
+- (TODO) Include micronucleus image for instant boot with V-USB mode on grounded pin
 
 ## Pinout
 - PB0 -> APA102 clock 
@@ -27,18 +33,20 @@ Description of UI modes & controls
 |------------------|------------|-------------|
 | Short Press      | 0ms        | Typical operations, menu navigation, confirmation |
 | Long Press       | 750ms      | Power off, escape to previous menu |
-| Super Long Press | 2000ms     | "Destructive" operations, write to eeprom; enter setup... |
+| Super Long Press | 2000ms     | "Destructive" operations, save mode & settings to EEPROM; enter setup... |
+| Mega Long Press  | 5000ms     | "Mega Destructive" operation; reset EEPROM |
 
 ### Modes
 | Mode        | Control     | Action |
 |-------------|-------------|--------|
 | Off | Short Press | On |
-|     | Long Press  | Setup Menu |
-| Setup | Rotate      | Set strip length |
-|       | Short Press | Setup 2 menu |
-|       | Long Press  | Save setting & restart|
-| On | Rotate           | adjustment 1 |
-|    | Short Press      | next submenu 1 |
+|     | Super Long Press  | Setup Menu |
+|     | Mega Long Press  | Reset EEPROM |
+| Setup | Rotate            | Set strip length |
+|       | Super Long Press  | Save setting & restart |
+| On | Rotate             | adjust current setting |
+|    | Short Press        | next setting |
+|    | Double Short Press | next mode |
 |    | Long Press       | Off |
 |    | Super Long Press | Save current settings as default |
 
