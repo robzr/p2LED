@@ -1,6 +1,9 @@
 /* free_memory() => 447 (before transition to state struct)
- *  454 => using Events ring buffer and state struct for switch
- * need 432 bytes for HSV[144] buffer to accomodate high density 1m strips
+ *               => 454 using Events ring buffer and state struct for switch
+ *               => 457 moved to mode state union
+ *               => 460 combined encoder buffers
+ *               
+ * need 432 bytes for LED HSV[144] buffer (high density 1m strips), plus memory for effect processing
  */
 #include <Arduino.h>
 #include <avr/eeprom.h> 
@@ -41,10 +44,9 @@
 #define SWITCH (1 << PIN_SWITCH)
 
 // For tuning encoder acceleration
-#define ENCODER_SCALE_WINDOW 100  // acceleration window in ms
+#define ENCODER_SCALE_WINDOW 60  // acceleration window in ms
 #define ENCODER_SCALE_FACTOR 10  // max linear accelleration = window / factor
 
-#define LED_STRIP_DEFAULT_LENGTH 10
 #define LED_STRIP_MAX_LENGTH 144
 
 // Interrupt event queue, minimize time spent in interrupt handler
@@ -71,34 +73,30 @@ struct Events {  // sizeof() = 1 + 2 * MAX_EVENT_COUNT
   struct Event_Queue queue[MAX_EVENT_COUNT];
 } volatile events;
 
+// if we was CRaZaaYYY we could turn these into two 4 bit bit fields with additional processing
 volatile uint8_t pinb_history;     // to determine which pin change event caused an interrupt
 volatile uint8_t encoder_history;  // to store first phase of quadrature events
 
+#define SWITCH_DOUBLE_PRESS_MS 250       // ms between presses to count as a double press
 #define SWITCH_PRESS_LONG_MS 750         // ms to count as a long switch event
 #define SWITCH_PRESS_SUPER_LONG_MS 2000  // ms to count as a super long switch event
-#define SWITCH_PRESS_MEGA_LONG_MS 10000  // ms to mega long (reset event)
-#define LAST_ACTIVE_TIMEOUT_MS 31000     // max length a "last state" can be active
+#define SWITCH_PRESS_MEGA_LONG_MS 5000   // ms to mega long (reset event)
+#define LAST_ACTIVE_TIMEOUT_MS 15750     // max length a "last state" can be active (14-bit == 16384 - headroom)
 
-const uint16_t state_last_time_mask = 0b111111111111111;  // (& state_switch_last_time_mask) == (% 0x8000)
-// const uint16_t state_switch_last_time_mask = 0b111111111111111;  // (& state_switch_last_time_mask) == (% 0x8000)
-// const uint16_t state_encoder_last_time_mask = 0b11111111111111;  // (& state_encoder_last_time_mask) == (% 0x4000)
+const uint16_t last_active_timeout_mask = 0b11111111111111;  // (& last_active_timeout_mask) == (% 0x4000)
 
 struct State {
-  uint8_t switch_press_short : 1;
-  uint8_t switch_press_long : 1;
-  uint8_t switch_press_super_long : 1;
-  uint8_t switch_press_mega_long : 1;
   uint16_t switch_last_active : 1;
-  uint16_t switch_last_time : 15;
-  uint16_t encoder_left_active : 1;  // could make encoder_*_time 14 bits, and save a word :)
-  uint16_t encoder_left_time : 15;
+  uint16_t switch_double_active : 1;
+  uint16_t switch_last_time : 14;
+  uint16_t encoder_left_active : 1;
   uint16_t encoder_right_active : 1;
-  uint16_t encoder_right_time : 15;
+  uint16_t encoder_last_time : 14;
 } state;
 
 enum Modes {
   Mode_Default = 0,
-  Mode_Setup,
+  Mode_Setup = 0,
   Mode_Solid,
   Mode_Wheel,
   Mode_Breathe,
@@ -111,19 +109,48 @@ enum Modes {
   Mode_Solid_Saturation,
   Mode_Solid_End,
   Mode_Wheel_Brightness = 0,
-  Mode_Wheel_Saturation,
   Mode_Wheel_Speed,
+  Mode_Wheel_Saturation,
   Mode_Wheel_End,
   Mode_Breathe_Brightness = 0,
+  Mode_Breathe_Speed,
   Mode_Breathe_Hue,
   Mode_Breathe_Saturation,
-  Mode_Breathe_Speed,
   Mode_Breathe_End,
+};
+
+const uint8_t PROGMEM mode_level1_max[Mode_End][Mode_Breathe_End + 1] = { 
+  {
+    LED_STRIP_MAX_LENGTH, // Mode_Setup_Length
+    0,
+    0,
+    0,
+    0,
+  }, {
+    255,  // Mode_Solid_Brightness
+    255,  // Mode_Solid_Hue
+    255,  // Mode_Solid_Saturation
+    0,
+    0,
+  }, {
+    255,  // Mode_Wheel_Brightness
+    255,  // Mode_Wheel_Speed
+    255,  // Mode_Wheel_Saturation
+    0,
+    0,
+  }, {
+    255,  // Mode_Breathe_Brightness
+    255,  // Mode_Breathe_Speed
+    255,  // Mode_Breathe_Hue
+    255,  // Mode_Breathe_Saturation
+    0,
+  },
 };
 
 union Mode_State {
   struct {
     uint16_t strip_length;  // only used during read/write from EEPROM
+    uint8_t startup_mode;
   } setup;
   struct {
     uint8_t brightness;    
@@ -141,6 +168,7 @@ union Mode_State {
     uint8_t saturation;
     uint8_t speed;
   } breathe;
+  uint8_t setting[Mode_Breathe_End];
 };
   
 struct Mode {  // for tracking operation mode; should this be inside of state?
@@ -149,16 +177,16 @@ struct Mode {  // for tracking operation mode; should this be inside of state?
   union Mode_State state;
 } mode;
 
-// EEPROM map .. TODO: make the mode offset a multiple of the mode enum to cut down on code
+// EEPROM map
+const uint16_t * Eeprom_Strip_Length = (uint16_t *) 0x00;
 const uint8_t * Eeprom_Startup_Mode = (uint8_t *) 0x02;
-const uint16_t * Eeprom_Strip_Length = (uint16_t *) 0x04;
 const uint8_t Eeprom_Sizeof_Mode_Setting = 0x10;  // Allow for more than just the union for future growth
 const uint16_t * Eeprom_End = (uint16_t *) (Mode_End * Eeprom_Sizeof_Mode_Setting);
 
 // encoder functions
 inline uint8_t encoder_accel(uint16_t) __attribute__((always_inline));
-inline uint8_t encoder_rotate_left(uint16_t, uint8_t);
-inline uint8_t encoder_rotate_right(uint16_t, uint8_t);
+inline uint8_t encoder_rotate_left(uint16_t, uint8_t, uint8_t);
+inline uint8_t encoder_rotate_right(uint16_t, uint8_t, uint8_t);
 // event handlers
 inline void event_encoder_left(uint16_t) __attribute__((always_inline));
 inline void event_encoder_right(uint16_t) __attribute__((always_inline));
@@ -178,8 +206,9 @@ inline uint8_t int_log2(uint16_t);
 inline void reboot(void);
 inline void eeprom_read_global_settings() __attribute__((always_inline));
 inline void eeprom_read_mode_settings();
+inline void eeprom_reset();
 inline void eeprom_write_mode_settings();
-
+inline void eeprom_write_setup_settings();
 
 void setup()
 {
@@ -210,8 +239,6 @@ void setup()
   
   if(!(PINB & SWITCH)) { // if the switch is depressed on startup, set the state up
     state.switch_last_active = true;
-    state.switch_press_short = true;
-    state.switch_press_long = true;
   }
   
 #ifdef DEBUG
@@ -219,6 +246,24 @@ void setup()
   delay(20);  
   Serial.print(F("\n\rsetup(); free="));
   Serial.println(freeMemory());
+
+  for(uint8_t i = 0; i < Mode_End; i++) {
+    for(uint8_t j = 0; j < Mode_Breathe_End + 1; j++) {
+      Serial.print(F("["));
+      Serial.print(i);
+      Serial.print(F("]["));
+      Serial.print(j);
+      Serial.print(F("] = "));
+      Serial.println(pgm_read_byte(&mode_level1_max[i][j]));
+    }
+  }
+  for(uint8_t i = 0; i < Mode_End; i++) {
+    for(uint8_t * eeptr = (uint8_t *) (i * 0x10); eeptr < (uint8_t *) ((i + 1) * 0x10); eeptr++) {
+      Serial.print(eeprom_read_byte(eeptr), HEX);
+      Serial.print(F(" "));
+    }
+    Serial.println();
+  }
 #endif
 
   eeprom_read_global_settings();
@@ -231,22 +276,15 @@ void loop()
   if(events.length) {
     process_event_queue();
 #ifdef DEBUG
-    if(mode.level0 == Mode_Setup) {
-      Serial.print(F("sLength:"));
-      Serial.println((long) mode.state.setup.strip_length);
-    } else if(mode.level0 == Mode_Solid) {
-      if(mode.level1 == Mode_Solid_Brightness) {
-        for(uint8_t x = 0; x < mode.state.solid.brightness; x++)
-          Serial.print(F("."));
-        Serial.println();
-      } else if(mode.level1 == Mode_Solid_Hue) {
-        Serial.print(F("Hue:"));
-        Serial.println(mode.state.solid.hue);
-      } else if(mode.level1 == Mode_Solid_Saturation) {
-        Serial.print(F("Sat:"));
-        Serial.println(mode.state.solid.saturation);
-      }
-    }
+  Serial.print(mode.level0);
+  Serial.print(F("."));
+  Serial.print(mode.level1);
+  Serial.print(F(": "));
+  Serial.println(mode.state.setting[mode.level1]);
+/*  if(mode.level1 == Mode_Solid_Brightness) {
+    for(uint8_t x = 0; x < mode.state.solid.brightness; x++)
+      Serial.print(F("."));
+    Serial.println(); */
 #endif    
   }
   process_timed_events();
@@ -269,35 +307,53 @@ ISR(PCINT0_vect)
 }
 
 
-inline void eeprom_read_global_settings() {
-  uint8_t startup_mode = eeprom_read_byte((uint8_t *) Eeprom_Startup_Mode);
-
-  mode.level0 = startup_mode >= Mode_End ? Mode_Solid : startup_mode;  // System has been reset, or never setup
-
+inline void eeprom_read_global_settings()
+{
   uint16_t strip_length = eeprom_read_word((uint16_t *) Eeprom_Strip_Length);
   
-  if(strip_length > LED_STRIP_MAX_LENGTH)  // length has never been set
-    strip_length = LED_STRIP_DEFAULT_LENGTH;
+  if(strip_length > LED_STRIP_MAX_LENGTH)  // System has been reset, or never setup
+    strip_length = LED_STRIP_MAX_LENGTH;
 
+  mode.level0 = eeprom_read_byte((uint8_t *) Eeprom_Startup_Mode);
+  
+  if(mode.level0 >= Mode_End)  // System has been reset, or never setup
+    mode.level0 = Mode_Solid;
+ 
 #ifdef DEBUG
   Serial.print(F("sLength: "));
-  Serial.print((long) mode.state.setup.strip_length);
+  Serial.print((long) strip_length);
   Serial.print(F(" Mode: "));
   Serial.println(mode.level0);
 #endif
-
-}
-inline void eeprom_read_mode_settings() {
-  eeprom_read_block((void *) &mode.state, (void *) ((uint16_t) mode.level0 * Eeprom_Sizeof_Mode_Setting), sizeof(Mode_State));
 }
 
-inline void eeprom_write_global_settings() {
-  eeprom_update_word((uint16_t *) Eeprom_Strip_Length, mode.state.setup.strip_length);
+inline void eeprom_read_mode_settings()
+{
+  eeprom_read_block((void *) &mode.state,
+                    (void *) ((uint16_t) mode.level0 * Eeprom_Sizeof_Mode_Setting),
+                    sizeof(Mode_State));
 }
 
-inline void eeprom_write_mode_settings() {
-  eeprom_update_byte((uint8_t *) Eeprom_Startup_Mode, (uint8_t) mode.level0);
-  eeprom_update_block((void *) &mode.state, (void *) ((uint16_t) mode.level0 * Eeprom_Sizeof_Mode_Setting), sizeof(Mode_State));
+inline void eeprom_reset()
+{
+  for(uint8_t * eeptr = (uint8_t *) 0; eeptr < (uint8_t *) Eeprom_End; eeptr++) {
+    eeprom_update_byte(eeptr, 0xFF);
+  }
+}
+
+inline void eeprom_write_setup_settings()
+{
+  eeprom_update_word((uint16_t *) Eeprom_Strip_Length,
+                     (uint16_t) mode.state.setup.strip_length);
+}
+
+inline void eeprom_write_mode_settings()
+{
+  eeprom_update_byte((uint8_t *) Eeprom_Startup_Mode,
+                     (uint8_t) mode.level0);
+  eeprom_update_block((void *) &mode.state,
+                      (void *) ((uint16_t) mode.level0 * Eeprom_Sizeof_Mode_Setting),
+                      sizeof(Mode_State));
 }
 
 inline uint8_t encoder_accel(uint16_t time_diff)
@@ -306,85 +362,56 @@ inline uint8_t encoder_accel(uint16_t time_diff)
          int_log2((ENCODER_SCALE_WINDOW - time_diff) | 2) / 2;
 }
 
-inline uint8_t encoder_rotate_left(uint16_t time_diff, uint8_t from_position) {
+inline uint8_t encoder_rotate_left(uint16_t time_diff, uint8_t value, uint8_t min) {
   if(state.encoder_left_active && time_diff < ENCODER_SCALE_WINDOW) {
     uint8_t tmp_byte = encoder_accel(time_diff); 
-    from_position -= from_position > tmp_byte ? tmp_byte : from_position;
-  } else if(from_position > 0) {
-    from_position--;
+    value -= value - min > tmp_byte ? tmp_byte : value - min;
+  } else if(value > min) {
+    value--;
   }
-  return from_position;
+  return value;
 }
 
-inline uint8_t encoder_rotate_right(uint16_t time_diff, uint8_t from_position) {
+inline uint8_t encoder_rotate_right(uint16_t time_diff, uint8_t value, uint8_t max) {
   if(state.encoder_right_active && time_diff < ENCODER_SCALE_WINDOW) {
     uint8_t tmp_byte = encoder_accel(time_diff);     
-    from_position += tmp_byte < 255 - from_position ? tmp_byte : 255 - from_position;
-  } else if(from_position < 255) {
-    from_position++;
+    value += tmp_byte < max - value ? tmp_byte : max - value;
+  } else if(value < max) {
+    value++;
   }
-  return from_position;
+  return value;
 }
 
 inline void event_encoder_left(uint16_t event_time)
 {
-  uint16_t time_diff = event_time - state.encoder_left_time;
-  
-  if(mode.level0 == Mode_Setup) {
-    mode.state.setup.strip_length = encoder_rotate_left(time_diff, mode.state.setup.strip_length);
-  } else if(mode.level0 == Mode_Solid) {
-    if(mode.level1 == Mode_Solid_Brightness)
-      mode.state.solid.brightness = encoder_rotate_left(time_diff, mode.state.solid.brightness);
-    else if(mode.level1 == Mode_Solid_Hue)
-      mode.state.solid.hue = encoder_rotate_left(time_diff, mode.state.solid.hue);
-    else if(mode.level1 == Mode_Solid_Saturation)
-      mode.state.solid.saturation = encoder_rotate_left(time_diff, mode.state.solid.saturation);    
-  }
-  
-  state.encoder_left_time = event_time;
+  uint16_t time_diff = event_time - state.encoder_last_time;
+
+  mode.state.setting[mode.level1] = encoder_rotate_left(time_diff,
+                                                        mode.state.setting[mode.level1],
+                                                        0);
+  state.encoder_last_time = event_time;
   state.encoder_left_active = true;
   state.encoder_right_active = false;
 }
 
 inline void event_encoder_right(uint16_t event_time)
 {
-  uint16_t time_diff = event_time - state.encoder_right_time;
+  uint16_t time_diff = event_time - state.encoder_last_time;
 
-  if(mode.level0 == Mode_Setup) {
-    mode.state.setup.strip_length = encoder_rotate_right(time_diff, mode.state.setup.strip_length);
-  } else if(mode.level0 == Mode_Solid) {
-    if(mode.level1 == Mode_Solid_Brightness)
-      mode.state.solid.brightness = encoder_rotate_right(time_diff, mode.state.solid.brightness);
-    else if(mode.level1 == Mode_Solid_Hue)
-      mode.state.solid.hue = encoder_rotate_right(time_diff, mode.state.solid.hue);
-    else if(mode.level1 == Mode_Solid_Saturation)
-      mode.state.solid.saturation = encoder_rotate_right(time_diff, mode.state.solid.saturation);    
-  }
-  
-  state.encoder_right_time = event_time;
+  mode.state.setting[mode.level1] = encoder_rotate_right(time_diff,
+                                                         mode.state.setting[mode.level1],
+                                                         pgm_read_byte(&(mode_level1_max[mode.level0][mode.level1])));
+                                                         // mode_ranges[mode.level0][mode.level1].max);
+  state.encoder_last_time = event_time;
   state.encoder_right_active = true;
   state.encoder_left_active = false;
 }
 
-inline void event_switch_press_short(void)
+inline void event_switch_double_press(void)
 {
 #ifdef DEBUG
-  Serial.println(F("shortPress"));  // This could be made more generic by incrementing the mode, and checking rollover
-#endif  
-  if(mode.level0 == Mode_Solid) {
-    if(++mode.level1 == Mode_Solid_End)
-      mode.level1 = Mode_Solid_Brightness;
-  } else if(mode.level0 == Mode_Wheel) {
-    if(++mode.level1 == Mode_Wheel_End)
-      mode.level1 = Mode_Wheel_Brightness;
-  } else if(mode.level0 == Mode_Breathe) {
-    if(++mode.level1 == Mode_Breathe_End)
-      mode.level1 = Mode_Breathe_Brightness;
-  }
-}
-
-inline void event_switch_press_long(void)
-{
+  Serial.println(F("doublePress"));  // This could be made more generic by incrementing the mode, and checking rollover
+#endif
   if(mode.level0 >= Mode_Solid) {
     if(++mode.level0 == Mode_End)
       mode.level0 = Mode_Solid;
@@ -392,25 +419,48 @@ inline void event_switch_press_long(void)
     mode.level1 = Mode_Default;
     eeprom_read_mode_settings();
   }
+}
+
+inline void event_switch_press_short(void)
+{
 #ifdef DEBUG
-  Serial.print(F("Mode: "));
-  Serial.println(mode.level0);
+  Serial.println(F("shortPress"));  // This could be made more generic by incrementing the mode, and checking rollover
 #endif
+ if(!pgm_read_byte(&(mode_level1_max[mode.level0][++mode.level1])))
+    mode.level1 = Mode_Default;
+}
+
+inline void event_switch_press_long(void)
+{
+#ifdef DEBUG
+  Serial.println(F("longPress"));  // This could be made more generic by incrementing the mode, and checking rollover
+#endif 
+  mode.level1 = Mode_Default;
 }
 
 inline void event_switch_press_super_long(void)
 {
-  if(state.switch_last_time == 0 && millis() < SWITCH_PRESS_SUPER_LONG_MS * 1.5) {
+  uint16_t mils = millis();  // TODO: unneeded when out of debug
+
+#ifdef DEBUG
+  Serial.print(F("superLongPress - s_l_t: "));  // This could be made more generic by incrementing the mode, and checking rollover
+  Serial.print(state.switch_last_time);
+  Serial.print(F(" millis(): "));
+  Serial.println(mils);
+#endif  
+  if(state.switch_last_time == 0 && mils < last_active_timeout_mask) {
 #ifdef DEBUG
     Serial.println(F("setup..."));
 #endif
     mode.level0 = Mode_Setup;
+    if(mode.state.setup.strip_length > LED_STRIP_MAX_LENGTH)  // System has been reset, or never setup
+      mode.state.setup.strip_length = LED_STRIP_MAX_LENGTH;
   } else {
 #ifdef DEBUG
     Serial.println(F("saving..."));
 #endif
     if(mode.level0 == Mode_Setup) {
-      eeprom_update_word((uint16_t *) Eeprom_Strip_Length, mode.state.setup.strip_length);
+      eeprom_write_setup_settings();
     } else {
       eeprom_write_mode_settings();
     }
@@ -420,19 +470,58 @@ inline void event_switch_press_super_long(void)
 
 inline void event_switch_press_mega_long(void)
 {
-  if(state.switch_last_time == 0 && millis() < SWITCH_PRESS_MEGA_LONG_MS * 1.5) {
+  uint16_t mils = millis();  // TODO: unneeded when out of debug
+#ifdef DEBUG
+  Serial.println(F("megaLongPress - s_l_t: "));  // This could be made more generic by incrementing the mode, and checking rollover
+  Serial.print(state.switch_last_time);
+  Serial.print(F(" millis(): "));
+  Serial.println(mils);
+#endif  
+  if(state.switch_last_time == 0 && mils < last_active_timeout_mask) {
 #ifdef DEBUG
     Serial.println(F("reset!"));
 #endif
-    for(uint16_t *eeptr = (uint16_t *) 0; eeptr < Eeprom_End; eeptr++) {
-      eeprom_update_word((uint16_t *) eeptr, (uint16_t) 0xFFFF);
-    }
+    eeprom_reset();
     reboot();
   }
 }
 
 inline void event_switch_release(void)
-{}
+{
+#ifdef DEBUG
+  Serial.print(F("switch_last_active: "));
+  Serial.print(state.switch_last_active);
+  Serial.print(F(" switch_double_active: "));
+  Serial.print(state.switch_double_active);
+  Serial.print(F(" now: "));
+  Serial.print(millis(), DEC);
+  Serial.print(F(" state.switch_last_time: "));
+  Serial.print(state.switch_last_time, DEC);
+  Serial.print(F(" get_last_time_diff: "));
+  Serial.println((long) get_last_time_diff(state.switch_last_time));
+#endif
+  if(state.switch_last_active) { // switch is down and last active timer has not rolled over
+    if(state.switch_double_active) {
+      event_switch_double_press();
+      
+      state.switch_last_active = false;
+      state.switch_double_active = false;
+    } else {
+      if(get_last_time_diff(state.switch_last_time) >= SWITCH_PRESS_MEGA_LONG_MS)
+        event_switch_press_mega_long();
+      else if(get_last_time_diff(state.switch_last_time) >= SWITCH_PRESS_SUPER_LONG_MS)
+        event_switch_press_super_long();
+      else if(get_last_time_diff(state.switch_last_time) >= SWITCH_PRESS_LONG_MS)
+        event_switch_press_long();
+      else
+        event_switch_press_short();
+        
+      state.switch_last_active = false;
+      state.switch_double_active = true;
+    }
+    state.switch_last_time = millis() & last_active_timeout_mask;
+  }
+}
 
 /*
 struct Event_Queue * events_pop()
@@ -474,6 +563,7 @@ inline void process_event_queue()
   while(events.length) {
     uint8_t tmp_event;
     uint16_t tmp_time;
+    // uint16_t now;
     
     cli();  // disable interrupts while we pop an event off the event queue
     tmp_time = events.queue[events.start].time;
@@ -482,79 +572,47 @@ inline void process_event_queue()
     events.length--;    
     sei();
 
-    // we need to recontsruct the 12 bit tmp.time into 15 bits
-    uint16_t now = millis() & state_last_time_mask;
-/*    
-Serial.print(F("millis: "));
-Serial.print((long) millis());
-Serial.print(F(" now:"));
-Serial.print((long) now);
-Serial.print(F(" tt:"));
-Serial.print((long) tmp_time);
-*/
-    if((now & event_queue_time_mask) >= tmp_time) {
+    uint16_t now = millis() & last_active_timeout_mask;
+
+    // we need to reconstruct the 12 bit tmp.time into 14/15 bits
+    if((now & event_queue_time_mask) >= tmp_time)
       tmp_time = (now & ~event_queue_time_mask) + tmp_time;
-//      Serial.print(F(" >= "));
-    } else {
-//      Serial.print(F(" < "));
-      tmp_time = ((now & ~event_queue_time_mask) + tmp_time - event_queue_time_mask) & state_last_time_mask;
-    }
-/*    
-Serial.print(F(" ltt:"));
-Serial.println((long) tmp_time);
-*/
-    if(tmp_event == Encoder_Left) {
-      event_encoder_left(tmp_time);
-    } else if(tmp_event == Encoder_Right) {
-      event_encoder_right(tmp_time);
+    else
+      tmp_time = ((now & ~event_queue_time_mask) + tmp_time - event_queue_time_mask) & last_active_timeout_mask;
+       
+    if(tmp_event == Encoder_Left || tmp_event == Encoder_Right) {
+      if(tmp_event == Encoder_Left)
+        event_encoder_left(tmp_time);
+      else
+        event_encoder_right(tmp_time); 
     } else if(tmp_event == Switch_Down) {
       state.switch_last_active = true;
       state.switch_last_time = tmp_time;
-      state.switch_press_short = false;
-      state.switch_press_long = false;
-      state.switch_press_super_long = false;
-      state.switch_press_mega_long = false;
     } else if(tmp_event == Switch_Up) {
-      state.switch_last_active = false;
       event_switch_release();
+      state.switch_last_active = false;
     }
   }
 }
 
 inline uint16_t get_last_time_diff(uint16_t last_time) {
-  return ((millis() - last_time) & state_last_time_mask);
+  return ((millis() - last_time) & last_active_timeout_mask);
 }
   
 inline void process_timed_events()
 {
-  if(state.switch_last_active) { // switch is down and last active timer has not rolled over
-    if(!state.switch_press_short) {
-      state.switch_press_short = true;
-      event_switch_press_short();
-    }
-    if(!state.switch_press_long && get_last_time_diff(state.switch_last_time) >= SWITCH_PRESS_LONG_MS) {
-      state.switch_press_long = true;
-      event_switch_press_long();
-    }
-    if(!state.switch_press_super_long && get_last_time_diff(state.switch_last_time) >= SWITCH_PRESS_SUPER_LONG_MS) {
-      state.switch_press_super_long = true;
-      event_switch_press_super_long();
-    }
-    if(!state.switch_press_mega_long && get_last_time_diff(state.switch_last_time) >= SWITCH_PRESS_MEGA_LONG_MS) {
-      state.switch_press_mega_long = true;
-      event_switch_press_mega_long();
-    }
-  }
-
-  // expire 15-bit time counters before they rollover; this allows event tracking ~30 seconds
-  if(state.encoder_left_active && get_last_time_diff(state.encoder_left_time) > LAST_ACTIVE_TIMEOUT_MS)
+  // expire time counters before they rollover
+  if(state.encoder_left_active && get_last_time_diff(state.encoder_last_time) > LAST_ACTIVE_TIMEOUT_MS)
     state.encoder_left_active = false;
 
-  if(state.encoder_right_active && get_last_time_diff(state.encoder_right_time) > LAST_ACTIVE_TIMEOUT_MS)
+  if(state.encoder_right_active && get_last_time_diff(state.encoder_last_time) > LAST_ACTIVE_TIMEOUT_MS)
     state.encoder_right_active = false;   
   
   if(state.switch_last_active && get_last_time_diff(state.switch_last_time) > LAST_ACTIVE_TIMEOUT_MS)
     state.switch_last_active = false;
+
+  if(state.switch_double_active && get_last_time_diff(state.switch_last_time) > SWITCH_DOUBLE_PRESS_MS)
+    state.switch_double_active = false;
 }
 
 inline void reboot(void)
